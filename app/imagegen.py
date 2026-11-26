@@ -90,9 +90,11 @@ def _post(url: str, payload: dict, key: str, timeout: int = 120) -> dict:
 
 def _download(url: str, dest: str, crop: bool = True) -> None:
     """下载并转成 PNG；顺手裁掉 SiliconFlow 加在右下角的「AI 生成」水印条。"""
-    req = urllib.request.Request(url, headers={"User-Agent": "xiaohan/1.0"})
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        blob = resp.read()
+    from . import safehttp
+
+    blob = safehttp.read_bytes(
+        url, headers={"User-Agent": "xiaohan/1.0"}, timeout=120, max_bytes=20 * 1024 * 1024,
+    )
     tmp = dest + ".raw"
     with open(tmp, "wb") as fh:
         fh.write(blob)

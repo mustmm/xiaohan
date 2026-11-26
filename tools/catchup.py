@@ -13,22 +13,50 @@ import time
 sys.path.insert(0, ".")
 
 from app.adapters.base import Incoming
-from app.adapters.wx4 import Wx4Adapter
 from app.brain import Brain
 from app.memory import Memory
 from app.model import LLM
 from app.persona import Persona
 from app.runtime import Runtime
-from app.stickers import StickerBook
+
+
+def model_name(cfg: dict) -> str:
+    """config.json 里的字段是 model，不是 name。"""
+    block = cfg.get("model") or {}
+    return block.get("model") or block.get("name") or "deepseek-chat"
+
+
+def find_latest_user(db, name: str):
+    """按会话名找最后一条对方消息。先精确匹配，避免「哥」补答到「哥哥」。"""
+    name = (name or "").strip()
+    if not name:
+        return None
+    sql = (
+        "select chat_id, chat_name, is_group, sender_id, sender_name, content, ts "
+        "from messages where chat_name = ? and role = 'user' order by id desc limit 1"
+    )
+    row = db.execute(sql, (name,)).fetchone()
+    if row:
+        return row
+    escaped = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    like_sql = (
+        "select chat_id, chat_name, is_group, sender_id, sender_name, content, ts "
+        "from messages where chat_name like ? escape '\\' and role = 'user' "
+        "order by id desc limit 1"
+    )
+    return db.execute(like_sql, (f"%{escaped}%",)).fetchone()
 
 
 def build():
+    from app.adapters.wx4 import Wx4Adapter
+    from app.stickers import StickerBook
+
     cfg = json.load(open("config.json", encoding="utf-8"))
     keys = json.load(open("keys.json", encoding="utf-8"))
     mem = Memory(cfg.get("db_path", "data/xiaohan.db"))
     llm = LLM(keys["deepseek_api_key"],
               base_url=cfg["model"]["base_url"],
-              model=cfg["model"].get("name", "deepseek-chat"))
+              model=model_name(cfg))
     brain = Brain(cfg, mem, Persona("persona.md"), llm, StickerBook())
     adapter = Wx4Adapter(poll_interval=cfg.get("wx4", {}).get("poll_interval", 1.0))
     rt = Runtime(cfg, mem, brain, adapter, log=lambda m: print("[catchup]", m, flush=True))
@@ -43,10 +71,7 @@ def main():
 
     cfg, mem, adapter, rt = build()
     db = sqlite3.connect(cfg.get("db_path", "data/xiaohan.db"))
-    row = db.execute(
-        "select chat_id, chat_name, is_group, sender_id, sender_name, content, ts "
-        "from messages where chat_name like ? and role = 'user' order by id desc limit 1",
-        (f"%{args.name}%",)).fetchone()
+    row = find_latest_user(db, args.name)
     if not row:
         print("数据库里没找到这个人的未回消息", flush=True)
         return 1

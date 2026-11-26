@@ -32,6 +32,13 @@ def _today_key(now: float) -> str:
     return "daily:" + time.strftime("%Y-%m-%d", time.localtime(now))
 
 
+def weekday_cn(now: float) -> str:
+    """本地星期。time.strftime('%w') 里 0 是星期日。"""
+    names = "日一二三四五六"
+    idx = int(time.strftime("%w", time.localtime(now)))
+    return "星期" + names[idx]
+
+
 def daily(memory, llm, name: str = "具小涵", now: float | None = None) -> dict:
     """今天的状态；没有就现场生成一次并落库。"""
     now = now or time.time()
@@ -43,11 +50,10 @@ def daily(memory, llm, name: str = "具小涵", now: float | None = None) -> dic
         except (ValueError, TypeError):
             pass
     date = time.strftime("%Y-%m-%d", time.localtime(now))
-    weekday = "一二三四五六日"[int(time.strftime("%w", time.localtime(now)))]
     try:
         text = llm.chat(
             [{"role": "user",
-              "content": _STATE_PROMPT.format(name=name, date=date, weekday="星期" + weekday)}],
+              "content": _STATE_PROMPT.format(name=name, date=date, weekday=weekday_cn(now))}],
             temperature=1.15, max_tokens=220,
         ) or ""
     except Exception:
@@ -177,6 +183,11 @@ def infer_due(now: float, text: str) -> float | None:
             hour = max(0, min(23, int(m.group(1))))
         except ValueError:
             hour = 20
+    # 「晚上8点」里的 8 是 20 点，不是第二天早上 8 点。
+    if any(w in text for w in ("下午", "晚上", "傍晚", "今晚")) and 1 <= hour <= 11:
+        hour += 12
+    elif "中午" in text and 1 <= hour <= 10:
+        hour += 12
     days = None
     if "今晚" in text or "今天晚上" in text:
         days = 0

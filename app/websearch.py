@@ -117,7 +117,7 @@ def search(query: str, n: int = 5, timeout: float = 8.0) -> list[dict]:
 def weather(city: str, timeout: float = 8.0) -> str:
     """天气走专用接口，比搜网页准（wttr.in 中文模式返回的是网页，从里面抠一行）。"""
     city = city.strip() or "长春"
-    url = f"https://wttr.in/{urllib.parse.quote(city)}?format=%l:+%c+%t+%w+%h+%p&lang=zh-cn&m"
+    url = "https://wttr.in/" + urllib.parse.quote(city, safe="") + "?format=%l:+%c+%t+%w+%h+%p&lang=zh-cn&m"
     try:
         page = _fetch(url, timeout=timeout)
     except Exception:  # noqa: BLE001

@@ -248,7 +248,7 @@ class Memory:
 
     def bump(self, k: str, day: str, n: int = 1) -> int:
         with self._lock:
-            row = self._db.execute("SELECT n FROM counters WHERE k=?", (k,)).fetchone()
+            row = self._db.execute("SELECT day, n FROM counters WHERE k=?", (k,)).fetchone()
             if row is None:
                 self._db.execute("INSERT INTO counters(k,day,n) VALUES(?,?,?)", (k, day, n))
                 total = n

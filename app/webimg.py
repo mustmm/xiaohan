@@ -48,17 +48,17 @@ def _bing_images(query: str, count: int = 30) -> list[str]:
 
 
 def _download(url: str) -> bytes | None:
-    req = urllib.request.Request(url, headers={
-        "User-Agent": UA,
-        "Referer": "https://www.bing.com/",
-        "Accept": "image/avif,image/webp,image/png,image/*,*/*;q=0.8",
-    })
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = resp.read(MAX_BYTES + 1)
+        from . import safehttp
+
+        data = safehttp.read_bytes(url, headers={
+            "User-Agent": UA,
+            "Referer": "https://www.bing.com/",
+            "Accept": "image/avif,image/webp,image/png,image/*,*/*;q=0.8",
+        }, timeout=15, max_bytes=MAX_BYTES)
     except Exception:  # noqa: BLE001
         return None
-    if not data or len(data) < MIN_BYTES or len(data) > MAX_BYTES:
+    if not data or len(data) < MIN_BYTES:
         return None
     return data
 

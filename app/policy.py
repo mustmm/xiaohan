@@ -93,6 +93,32 @@ def looks_like_question(text: str) -> bool:
     return any(w in t for w in QUESTION_WORDS)
 
 
+def _as_enabled(raw, default: bool = True) -> bool:
+    if raw is None:
+        return default
+    try:
+        return int(raw) != 0
+    except (TypeError, ValueError):
+        return bool(raw)
+
+
+def proactive_cap(contact: dict | None, limits: dict | None) -> int:
+    """这个人今天最多主动几条。0 就是 0，不能被 ``or`` 吃成默认值。"""
+    limits = limits or {}
+    default = limits.get("per_friend_per_day", 1)
+    raw = default if contact is None else contact.get("proactive_limit", default)
+    if raw is None or raw == "":
+        raw = default
+    try:
+        cap = int(raw)
+    except (TypeError, ValueError):
+        try:
+            cap = int(default)
+        except (TypeError, ValueError):
+            cap = 1
+    return max(0, cap)
+
+
 def group_should_insert(*, is_mentioned: bool, new_messages: int, last_self_ts: float,
                         inserted_this_hour: int, inserted_today: int, now: float,
                         limits: dict, last_sender: str = "", last_self_sender: str = "",
@@ -101,13 +127,14 @@ def group_should_insert(*, is_mentioned: bool, new_messages: int, last_self_ts: 
 
     原则（用户要求）：尽量一句一答，别让话掉地上。
     只有这些情况才不出声：撞上每小时/每天上限、或者纯表情/单字刷屏。
+    被 @ 也要守每小时/每天的上限，不然刷 @ 就能把群刷屏。
     """
-    if is_mentioned:
-        return True
     if inserted_this_hour >= limits.get("per_hour_per_group", 12):
         return False
     if inserted_today >= limits.get("per_day_per_group", 60):
         return False
+    if is_mentioned:
+        return True
 
     body = (text or "").strip()
     tiny = len(body) <= 2 and not question   # 「草」「哈哈哈」这种
@@ -139,14 +166,9 @@ def can_proactive(*, contact: dict | None, sent_today: int, now: float,
         return False
     if in_quiet_hours(now, limits.get("quiet_start", 0), limits.get("quiet_end", 7)):
         return False
-    if contact is not None and not contact.get("proactive_enabled", 1):
+    if contact is not None and not _as_enabled(contact.get("proactive_enabled", 1)):
         return False
-    cap = 1
-    if contact is not None:
-        cap = int(contact.get("proactive_limit") or limits.get("per_friend_per_day", 1))
-    else:
-        cap = limits.get("per_friend_per_day", 1)
-    return sent_today < cap
+    return sent_today < proactive_cap(contact, limits)
 
 MEDIA_RE = re.compile(r"[\[【]\s*(自拍|画|找图|找表情)\s*[:：]\s*([^\]】]+?)\s*[\]】]")
 

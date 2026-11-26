@@ -17,6 +17,9 @@ from ctypes import wintypes as w
 from pathlib import Path
 
 from app.adapters.base import Adapter, Incoming
+from app.wxtext import chat_matches, parse_poke, redact_special, safe_token, strip_group_prefix
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 _u32 = ctypes.WinDLL("user32", use_last_error=True)
 
@@ -108,56 +111,6 @@ def _show_window(hwnd: int) -> None:
         _u32.ShowWindow(hwnd, 5)      # SW_SHOW
     _u32.SetForegroundWindow(hwnd)
     time.sleep(0.35)
-
-def _xml_text(raw: str) -> str:
-    """把一段 XML 扒成纯文字：去标签、反转义、压掉多余空白。"""
-    import html
-
-    if not raw:
-        return ""
-    text = re.sub(r"<[^>]+>", "", raw)
-    text = html.unescape(text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def _parse_quote(content: str) -> tuple[str, str] | None:
-    """识别引用消息：返回 (被引用的人, 被引用的话)。"""
-    if not content or "<refermsg>" not in content:
-        return None
-    ref = re.search(r"<refermsg>(.*?)</refermsg>", content, re.S)
-    if not ref:
-        return None
-    inner = ref.group(1)
-    who = ""
-    m = re.search(r"<displayname>(.*?)</displayname>", inner, re.S)
-    if m:
-        who = _xml_text(m.group(1))
-    body = ""
-    m = re.search(r"<content>(.*?)</content>", inner, re.S)
-    if m:
-        body = _xml_text(m.group(1))
-    if not body:
-        m = re.search(r"<title>(.*?)</title>", inner, re.S)
-        if m:
-            body = _xml_text(m.group(1))
-    return who or "对方", body[:120]
-
-
-def _parse_poke(content: str) -> str:
-    """识别拍一拍：返回一句人话，例如「"郑博" 拍了拍 "小涵"」。"""
-    if not content or "拍了拍" not in content:
-        return ""
-    # 优先只取 <title>，避免把 <type>62</type> 这种也带出来
-    m = re.search(r"<title>(.*?)</title>", content, re.S)
-    if m:
-        plain = _xml_text(m.group(1)).strip()
-        if "拍了拍" in plain:
-            return plain[:60]
-    plain = re.sub(r"<[^>]+>", " ", content)
-    plain = _xml_text(plain).strip()
-    plain = re.sub(r"\s+", " ", plain)
-    return plain[:60] if "拍了拍" in plain else ""
-
 
 # 微信 4.x 的库把消息类型给成中文，这里统一翻译一遍
 TYPE_ALIAS = {
@@ -262,9 +215,39 @@ class Wx4Adapter(Adapter):
             self._names[username] = name
         return name
 
-    def send_text(self, chat_id: str, text: str, is_group: bool) -> None:
-        if not text.strip():
-            return
+    def _confirm_chat(self, wx, name: str, attempts: int = 2):
+        """切到 name，并且当前会话名一致才把客户端交回去。
+
+        SendMsg / SendFiles 不带 who 时会发进当前打开的会话。对不上就返回 None。
+        """
+        name = (name or "").strip()
+        if not name:
+            return None
+        for _ in range(attempts):
+            try:
+                current = (wx.ChatInfo() or {}).get("chat_name") or ""
+            except Exception:
+                current = ""
+            if chat_matches(current, name):
+                return wx
+            try:
+                wx.ChatWith(name)
+                current = (wx.ChatInfo() or {}).get("chat_name") or ""
+            except Exception:
+                current = ""
+            if chat_matches(current, name):
+                return wx
+            time.sleep(0.6)
+            self._restore_window()
+            try:
+                wx = self._client()
+            except Exception:
+                return None
+        return None
+
+    def send_text(self, chat_id: str, text: str, is_group: bool) -> bool:
+        if not text or not text.strip():
+            return False
         name = self.display_name(chat_id)
         # 抢焦点之前先把用户的前台窗口记下来，_client() 内部会强制把微信拉前
         prev_fg = _focus_guard()
@@ -273,7 +256,7 @@ class Wx4Adapter(Adapter):
         except Exception as exc:  # noqa: BLE001
             print(f"[wx4] 拿不到微信客户端：{exc}", flush=True)
             self._wx = None
-            return
+            return False
         wx_hwnd = getattr(wx._gui, "main_hwnd", 0) or 0
         if prev_fg in (0, wx_hwnd):
             prev_fg = _focus_guard() if prev_fg == 0 else 0
@@ -281,33 +264,21 @@ class Wx4Adapter(Adapter):
         try:
             if not self._chat_exists(chat_id, name):
                 print(f"[wx4] 跳过：微信里没有这个人/群（{name}）", flush=True)
-                return
+                return False
             # 先切会话，再核对当前会话确实是目标，最后不带 who 发送
             # ——SendMsg 带 who 失败时会退回"当前打开的会话"，那样会发错人
-            landed = False
-            for _ in range(2):
-                try:
-                    if (wx.ChatInfo() or {}).get("chat_name") == name:
-                        landed = True
-                        break
-                except Exception:
-                    pass
-                wx.ChatWith(name)
-                info = wx.ChatInfo() or {}
-                if (info.get("chat_name") or "") == name:
-                    landed = True
-                    break
-                time.sleep(0.8)
-                self._restore_window()
-                wx = self._client()
-            if not landed:
+            wx = self._confirm_chat(wx, name)
+            if wx is None:
                 print(f"[wx4] 会话没切过去（要 {name}），跳过", flush=True)
-                return
+                return False
             res = wx.SendMsg(text)
             if not _ok(res):
                 print(f"[wx4] 发送失败：{res!r}", flush=True)
+                return False
+            return True
         except Exception as exc:  # noqa: BLE001
             print(f"[wx4] 发送异常：{exc}", flush=True)
+            return False
         finally:
             self._restore_blockers()
             _restore_focus(prev_fg, wx_hwnd)
@@ -345,9 +316,11 @@ class Wx4Adapter(Adapter):
             if not self._chat_exists(chat_id, name):
                 print(f"[wx4] 跳过（没有会话）：{name}", flush=True)
                 return False
-            if (wx.ChatInfo() or {}).get("chat_name") != name:
-                wx.ChatWith(name)
-                time.sleep(0.6)
+            # 和文字一样：没核对到目标会话就不要发，否则图会进当前打开的聊天。
+            wx = self._confirm_chat(wx, name)
+            if wx is None:
+                print(f"[wx4] 会话没切过去（要 {name}），图片不发", flush=True)
+                return False
             res = wx.SendFiles(path, who=None)
             ok = bool(getattr(res, "is_success", False)) if res is not None else False
             print(f"[wx4] 发图 → {name}: {getattr(res, 'message', res)}", flush=True)
@@ -366,15 +339,13 @@ class Wx4Adapter(Adapter):
         except Exception as exc:  # noqa: BLE001
             print(f"[wx4] 拍一拍失败：{exc}", flush=True)
             return False
-        prev_fg = _foreground()
+        prev_fg = _focus_guard()
         try:
-            if (wx.ChatInfo() or {}).get("chat_name") != name:
-                if not self._chat_exists(chat_id, name):
-                    return False
-                wx.ChatWith(name)
-                time.sleep(0.4)
-                if (wx.ChatInfo() or {}).get("chat_name") != name:
-                    return False
+            if not self._chat_exists(chat_id, name):
+                return False
+            wx = self._confirm_chat(wx, name, attempts=1)
+            if wx is None:
+                return False
             res = wx.Poke()
             ok = bool(getattr(res, "is_success", False)) if res is not None else False
             print(f"[wx4] 拍回去 → {name}: {getattr(res, 'message', res)}", flush=True)
@@ -385,7 +356,7 @@ class Wx4Adapter(Adapter):
         finally:
             _restore_focus(prev_fg, _find_wechat_hwnd())
 
-    def send_sticker(self, chat_id: str, bmp_path: str) -> None:
+    def send_sticker(self, chat_id: str, bmp_path: str) -> bool:
         """表情包：微信 4.x 可以按图片直接发。"""
         name = self.display_name(chat_id)
         try:
@@ -393,21 +364,23 @@ class Wx4Adapter(Adapter):
         except Exception as exc:  # noqa: BLE001
             print(f"[wx4] 拿不到微信客户端：{exc}", flush=True)
             self._wx = None
-            return
+            return False
         try:
             if not self._chat_exists(chat_id, name):
                 print(f"[wx4] 跳过表情：微信里没有（{name}）", flush=True)
-                return
-            wx.ChatWith(name)
-            info = wx.ChatInfo() or {}
-            if (info.get("chat_name") or "") != name:
+                return False
+            wx = self._confirm_chat(wx, name, attempts=1)
+            if wx is None:
                 print(f"[wx4] 表情会话没切过去（要 {name}），跳过", flush=True)
-                return
+                return False
             res = wx.SendFiles(bmp_path)
             if not _ok(res):
                 print(f"[wx4] 发图失败：{res!r}", flush=True)
+                return False
+            return True
         except Exception as exc:  # noqa: BLE001
             print(f"[wx4] 发图异常：{exc}", flush=True)
+            return False
         finally:
             self._restore_blockers()
 
@@ -422,7 +395,8 @@ class Wx4Adapter(Adapter):
         key = ""
         try:
             import json as _json
-            with open("keys.json", encoding="utf-8") as fh:
+            key_path = os.path.join(_ROOT, "keys.json")
+            with open(key_path, encoding="utf-8") as fh:
                 key = (_json.load(fh) or {}).get("siliconflow_api_key") or ""
         except Exception:
             key = ""
@@ -435,7 +409,6 @@ class Wx4Adapter(Adapter):
             return ""
         import html
         import re as _re
-        import urllib.request
 
         url = ""
         for attr in ("cdnurl", "thumburl"):
@@ -449,18 +422,28 @@ class Wx4Adapter(Adapter):
         m = _re.search(r'md5\s*=\s*"([^"]+)"', content or "")
         if m:
             md5 = m.group(1)
-        dest_dir = os.path.join("data", "incoming")
+        dest_dir = os.path.join(_ROOT, "data", "incoming")
         os.makedirs(dest_dir, exist_ok=True)
-        raw = os.path.join(dest_dir, f"emoji_{md5 or 'x'}.gif")
+        token = safe_token(md5) or "x"
+        raw = os.path.join(dest_dir, f"emoji_{token}.gif")
+        root = os.path.realpath(dest_dir)
+        full = os.path.realpath(raw)
+        if os.path.commonpath([root, full]) != root:
+            return ""
         try:
-            req = urllib.request.Request(
-                url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://wx.qq.com/"})
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                data = resp.read()
+            from app import safehttp
+
+            data = safehttp.read_bytes(
+                url,
+                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://wx.qq.com/"},
+                timeout=20,
+                max_bytes=8 * 1024 * 1024,
+            )
             if len(data) < 200:
                 return ""
-            with open(raw, "wb") as f:
+            with open(full, "wb") as f:
                 f.write(data)
+            raw = full
         except Exception as exc:  # noqa: BLE001
             print(f"[wx4] 表情下载失败: {exc}", flush=True)
             return ""
@@ -542,26 +525,13 @@ class Wx4Adapter(Adapter):
         content = msg.get("content") or ""
         # 拍一拍在 4.x 里是 appmsg(type=62) 走「文件/链接/卡片」，不是「系统消息」，
         # 所以必须在安全改写之前先认出来，否则会变成「[链接]（她没点开）」。
-        poke = _parse_poke(content)
+        poke = parse_poke(content)
         if poke:
             self._last_poke[username] = time.time()
             content = f"（{poke}）"
             mtype = "_poke"
-        # 安全：陌生链接 / 文件 / 二维码一律不碰，不下载、不打开，只当一句话记下
-        if mtype in ("link", "file", "card"):
-            safe = TYPE_PLACEHOLDER.get(mtype, f"[{raw_type}]")
-            if mtype == "link":
-                quoted = _parse_quote(content)
-                if quoted:
-                    who, said = quoted
-                    content = f"（引用「{who}」说的：{said}）"
-                else:
-                    content = safe + "（她没点开，也没下载）"
-            else:
-                title = _xml_text(content)[:60] if content else ""
-                content = safe + ("（她没打开、没下载）" if not title
-                                  else f"：{title}（她没打开、没下载）")
-            mtype = "_safe_skip"
+        # 链接 / 文件 / 红包 / 位置 / 通话：不打开，引用则保留对方新说的那句。
+        mtype, content = redact_special(mtype, content, raw_type)
         if mtype == "image":
             desc = self.see_image(username, msg.get("local_id"), msg.get("shard"))
         elif mtype == "emoji":
@@ -574,26 +544,8 @@ class Wx4Adapter(Adapter):
                 content = f"[{tag}：{desc}]"
             else:
                 content = TYPE_PLACEHOLDER.get(mtype, f"[{raw_type}]")
-        elif mtype == "link":
-            quoted = _parse_quote(content)
-            if quoted:
-                who, said = quoted
-                mine = ""
-                m = re.search(r"<title>(.*?)</title>", content, re.S)
-                if m:
-                    mine = _xml_text(m.group(1))
-                elif content and not content.strip().startswith("<"):
-                    mine = content.strip()
-                if mine:
-                    content = f"（引用「{who}」说的：{said}）\n{mine}"
-                else:
-                    content = f"（引用「{who}」说的：{said}）"
-            else:
-                content = TYPE_PLACEHOLDER.get(mtype, f"[{raw_type}]") + (
-                    f" {_xml_text(content)[:80]}（她没点开）" if content else ""
-                )
         elif mtype == "system":
-            poke = _parse_poke(content)
+            poke = parse_poke(content)
             if poke:
                 content = f"（{poke}）"
                 self._last_poke[username] = time.time()
@@ -611,7 +563,7 @@ class Wx4Adapter(Adapter):
                 sender_name = ""
         sender_name = sender_name or self.display_name(username)
         if is_group:
-            content = _strip_group_prefix(content)
+            content = strip_group_prefix(content)
         return Incoming(
             chat_id=username,
             chat_name=self.display_name(username),
@@ -773,16 +725,6 @@ def _is_system_account(username: str) -> bool:
     if u in _SYSTEM_EXACT:
         return True
     return u.startswith("gh_")
-
-
-def _strip_group_prefix(content: str) -> str:
-    """群消息在库里是 "wxid_xxx:\\n正文"，把发送者前缀切掉。"""
-    if not content:
-        return content
-    m = re.match(r"^\s*(?:wxid_[0-9A-Za-z_\-]+|[0-9A-Za-z_\-]{5,40}):\s*", content)
-    if m:
-        return content[m.end():].lstrip("\n")
-    return content
 
 
 def _ok(res) -> bool:

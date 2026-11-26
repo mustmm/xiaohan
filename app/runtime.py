@@ -33,11 +33,13 @@ class Runtime:
     # ---------- 发送 ----------
 
     def say(self, chat_id: str, parts: list[str], is_group: bool,
-            max_bubbles: int | None = None) -> None:
+            max_bubbles: int | None = None) -> list[str]:
+        """发出去的才返回。适配器明确返回 False，或发送抛错，就停，不把没送出的话记成已回。"""
         if max_bubbles:
             parts = parts[:max_bubbles]
+        sent: list[str] = []
         for i, part in enumerate(parts):
-            if not part.strip():
+            if not part or not part.strip():
                 continue
             delay = policy.typing_delay(
                 part,
@@ -47,33 +49,56 @@ class Runtime:
             )
             if i == 0:
                 delay = min(delay, self.typing.get("first_delay_max", 1.2))
-            time.sleep(delay)
-            with self._send_lock:
-                self.adapter.send_text(chat_id, part, is_group)
+            if delay > 0:
+                time.sleep(delay)
+            try:
+                with self._send_lock:
+                    result = self.adapter.send_text(chat_id, part, is_group)
+            except Exception as exc:  # noqa: BLE001
+                self.log(f"发送失败 [{chat_id}]: {exc}")
+                break
+            if result is False:
+                self.log(f"发送未成功，停在 [{chat_id}]")
+                break
+            sent.append(part)
             self.log(f"→ [{chat_id}] {part}")
+        return sent
+
+    def _record_out(self, chat_id: str, chat_name: str, is_group: bool,
+                    parts: list[str], ts: float | None = None) -> None:
+        for part in parts:
+            self.memory.add_message(
+                chat_id=chat_id, chat_name=chat_name, is_group=is_group,
+                sender_id="self", sender_name="具小涵", role="assistant",
+                content=part, ts=ts or time.time(),
+            )
 
     # ---------- 表情包 ----------
 
-    def send_sticker(self, chat_id: str, label: str, is_group: bool) -> None:
+    def send_sticker(self, chat_id: str, label: str, is_group: bool) -> bool:
         book = getattr(self.brain, "stickers", None)
         sender = getattr(self.adapter, "send_sticker", None)
         if not book or not sender:
-            return
+            return False
         item = book.pick(label)
         if not item:
-            return
+            return False
         try:
             time.sleep(random.uniform(0.6, 1.6))
             with self._send_lock:
-                sender(chat_id, item["path"])
+                result = sender(chat_id, item["path"])
+            if result is False:
+                return False
             self.log(f"→ [{chat_id}] [表情:{item.get('caption')}]")
             self.memory.add_message(
                 chat_id=chat_id, chat_name=chat_id, is_group=is_group,
                 sender_id="self", sender_name="具小涵", role="assistant",
                 content=f"[表情:{item.get('caption')}]", ts=time.time(),
             )
+            return True
         except Exception as exc:  # noqa: BLE001
             self.log(f"表情包发送失败: {exc}")
+            return False
 
     # ---------- 收消息 ----------
 
@@ -144,12 +169,9 @@ class Runtime:
             if hit and not self._is_elder(msg):
                 reply = kougei.make_reply(hit)
                 self.log(f"雷霆接梗：「{hit}」→ {reply}")
-                self.say(msg.chat_id, [reply], msg.is_group)
-                self.memory.add_message(
-                    chat_id=msg.chat_id, chat_name=msg.chat_name, is_group=msg.is_group,
-                    sender_id="self", sender_name="具小涵", role="assistant",
-                    content=reply, ts=time.time(),
-                )
+                sent = self.say(msg.chat_id, [reply], msg.is_group)
+                if sent:
+                    self._record_out(msg.chat_id, msg.chat_name, msg.is_group, sent)
                 return
 
         correction = self._learn_correction(msg)
@@ -184,22 +206,20 @@ class Runtime:
         # 对方只说几个字，就别砸一堆气泡过去（不然看着像自己在跟自己聊）
         brief = len(msg.content.strip())
         max_bubbles = 1 if brief <= 8 else (2 if brief <= 22 else 3)
+        sent: list[str] = []
         if texts:
             # 同一个会话至少隔 5 秒，避免机关枪式连发
             gap = 5.0 - (time.time() - self._last_say.get(msg.chat_id, 0.0))
             if gap > 0:
                 time.sleep(min(gap, 5.0))
-            self.say(msg.chat_id, texts, msg.is_group, max_bubbles=max_bubbles)
-            self._last_say[msg.chat_id] = time.time()
+            sent = self.say(msg.chat_id, texts, msg.is_group, max_bubbles=max_bubbles)
+            if sent:
+                self._last_say[msg.chat_id] = time.time()
         for label in labels[:1]:
             self.send_sticker(msg.chat_id, label, msg.is_group)
-        for part in texts:
-            self.memory.add_message(
-                chat_id=msg.chat_id, chat_name=msg.chat_name, is_group=msg.is_group,
-                sender_id="self", sender_name="具小涵", role="assistant",
-                content=part, ts=time.time(),
-            )
-        if msg.is_group:
+        if sent:
+            self._record_out(msg.chat_id, msg.chat_name, msg.is_group, sent)
+        if msg.is_group and sent:
             self.memory.bump(hour_key, day)
             self.memory.bump(f"g_d:{msg.chat_id}", day)
 
@@ -207,7 +227,8 @@ class Runtime:
         if "拍了拍" in msg.content and not msg.is_group:
             if hasattr(self.adapter, "send_poke") and random.random() < 0.5:
                 try:
-                    self.adapter.send_poke(msg.chat_id)
+                    with self._send_lock:
+                        self.adapter.send_poke(msg.chat_id)
                 except Exception as exc:  # noqa: BLE001
                     self.log(f"拍回去失败: {exc}")
 
@@ -245,7 +266,7 @@ class Runtime:
             wxid, name=name,
             relation=cur.get("relation") or "",
             note=cur.get("note") or "",
-            proactive_limit=int(cur.get("proactive_limit") or 1),
+            proactive_limit=policy.proactive_cap(cur, self.cfg["limits"]["proactive"]),
             proactive_enabled=want,
         )
 
@@ -276,16 +297,15 @@ class Runtime:
         texts, labels = policy.extract_stickers(parts)
         if not texts and not labels:
             return False
-        if texts:
-            self.say(contact["wxid"], texts, False)
+        sent = self.say(contact["wxid"], texts, False) if texts else []
+        sticker_ok = False
         for label in labels[:1]:
-            self.send_sticker(contact["wxid"], label, False)
-        for part in texts:
-            self.memory.add_message(
-                chat_id=contact["wxid"], chat_name=contact.get("name") or contact["wxid"],
-                is_group=False, sender_id="self", sender_name="具小涵",
-                role="assistant", content=part, ts=time.time(),
-            )
+            if self.send_sticker(contact["wxid"], label, False):
+                sticker_ok = True
+        if sent:
+            self._record_out(contact["wxid"], contact.get("name") or contact["wxid"], False, sent)
+        if not sent and not sticker_ok:
+            return False
         self.memory.bump(f"p:{contact['wxid']}", day)
         return True
 
@@ -331,12 +351,14 @@ class Runtime:
             if send is None:
                 self.log("这版适配器发不了图")
                 return
-            ok = send(chat_id, path, is_group)
+            with self._send_lock:
+                ok = send(chat_id, path, is_group)
             self.log(f"画好了并发出：{os.path.basename(path)} → {ok}")
-            self.memory.add_message(
-                chat_id=chat_id, chat_name=chat_id, is_group=is_group,
-                sender_id="", sender_name="具小涵", role="assistant",
-                content=f"[{'自拍' if kind == '自拍' else '画'}]{arg}", ts=time.time(),
+            if ok is not True:
+                return
+            self._record_out(
+                chat_id, chat_id, is_group,
+                [f"[{'自拍' if kind == '自拍' else '画'}]{arg}"],
             )
         except Exception as exc:  # noqa: BLE001
             self.log(f"画图出错：{exc}")
@@ -392,13 +414,12 @@ class Runtime:
             if send is None:
                 self.log("这版适配器发不了图")
                 return
-            ok = send(chat_id, path, is_group)
+            with self._send_lock:
+                ok = send(chat_id, path, is_group)
             self.log(f"找到图并发出：{os.path.basename(path)} → {ok}")
-            self.memory.add_message(
-                chat_id=chat_id, chat_name=chat_id, is_group=is_group,
-                sender_id="", sender_name="具小涵", role="assistant",
-                content=f"[找图]{keyword}", ts=time.time(),
-            )
+            if ok is not True:
+                return
+            self._record_out(chat_id, chat_id, is_group, [f"[找图]{keyword}"])
         except Exception as exc:  # noqa: BLE001
             self.log(f"找图出错：{exc}")
 
@@ -415,6 +436,8 @@ class Runtime:
     # ---------- 朋友圈 ----------
     def _maybe_post_moment(self, now: float) -> None:
         """到点了就自己发条朋友圈：一天最多 per_day 条，只在 window 里，按概率来。"""
+        if not self.features.get("allow_moments_post", True):
+            return
         cfg = (self.cfg.get("moments") or {})
         if not cfg.get("enabled"):
             return
@@ -494,13 +517,22 @@ class Runtime:
             self.memory.kv_set(browse.TS_KEY, int(now))
             return
 
-        cands = [
-            c for c in self.memory.contacts()
-            if c.get("proactive_enabled", 1)
-            and c.get("name") not in self._BROWSE_BAN
-            and (c.get("relation") or c.get("note"))
-            and not str(c.get("wxid", "")).endswith("@chatroom")
-        ]
+        limits = self.cfg["limits"]["proactive"]
+        cands = []
+        for c in self.memory.contacts():
+            wxid = str(c.get("wxid") or "")
+            if not c.get("proactive_enabled", 1):
+                continue
+            if c.get("name") in self._BROWSE_BAN:
+                continue
+            if not (c.get("relation") or c.get("note")):
+                continue
+            if wxid.endswith("@chatroom"):
+                continue
+            sent_today = self.memory.get_counter(f"p:{wxid}", day)
+            if not policy.can_proactive(contact=c, sent_today=sent_today, now=now, limits=limits):
+                continue
+            cands.append(c)
         if not cands:
             return
         item = browse.pick(self.memory, now)
@@ -517,11 +549,11 @@ class Runtime:
             return
         if not texts:
             return
-        self.say(target["wxid"], texts, False)
-        self.memory.add_message(
-            chat_id=target["wxid"], chat_name=target.get("name") or "", is_group=False,
-            sender_id=target["wxid"], sender_name=target.get("name") or "",
-            role="assistant", content="|||".join(texts), ts=int(now))
+        sent = self.say(target["wxid"], texts, False)
+        if not sent:
+            return
+        self._record_out(target["wxid"], target.get("name") or "", False, sent, ts=now)
+        self.memory.bump(f"p:{target['wxid']}", day)
         self.memory.kv_set("browse_count",
                            str(int(self.memory.kv_get("browse_count") or 0) + 1))
         self.log(f"刷到东西分享给 {target.get('name')}：{hint[:40]}")
@@ -564,11 +596,17 @@ class Runtime:
 
     def _deliver_callbacks(self, now: float) -> None:
         """隔天补刀：她说过的「[补:xxx]」，到期了补一句。"""
+        limits = self.cfg["limits"]["proactive"]
+        day = policy.today(now)
         for item in life.due_callbacks(self.memory, now, limit=2):
             wxid = item.get("wxid") or ""
             contact = self.memory.contact(wxid) if wxid else None
-            if not contact or not contact.get("proactive_enabled", 1):
+            if not contact or not int(contact.get("proactive_enabled") or 0):
                 life.pop_callback(self.memory, item)
+                continue
+            sent_today = self.memory.get_counter(f"p:{wxid}", day)
+            if not policy.can_proactive(contact=contact, sent_today=sent_today, now=now,
+                                        limits=limits):
                 continue
             name = contact.get("name") or item.get("name") or ""
             try:
@@ -582,15 +620,15 @@ class Runtime:
             parts = [p for p in (parts or []) if p.strip()]
             if parts:
                 texts, labels = policy.extract_stickers(parts)
-                if texts:
-                    self.say(wxid, texts, False)
-                    for part in texts:
-                        self.memory.add_message(
-                            chat_id=wxid, chat_name=name, is_group=False,
-                            sender_id="self", sender_name="具小涵",
-                            role="assistant", content=part, ts=time.time(),
-                        )
-                self.log(f"补刀 → {name}：{item.get('what')}")
+                sent = self.say(wxid, texts, False) if texts else []
+                if texts and not sent:
+                    continue
+                if sent:
+                    self._record_out(wxid, name, False, sent)
+                    self.memory.bump(f"p:{wxid}", day)
+                    self.log(f"补刀 → {name}：{item.get('what')}")
+                for label in labels[:1]:
+                    self.send_sticker(wxid, label, False)
             life.pop_callback(self.memory, item)
 
     def _free_roam(self, now: float) -> None:
@@ -717,11 +755,24 @@ class Runtime:
     # ---------- 约定到期：自己提出来 ----------
 
     def _deliver_promises(self, now: float) -> None:
+        limits = self.cfg["limits"]["proactive"]
+        day = policy.today(now)
         for item in life.due_promises(self.memory, now):
             wxid = item.get("wxid") or ""
             chat_id = item.get("chat_id") or wxid
             name = item.get("name") or chat_id
-            if life.quiet(now):
+            is_group = str(chat_id).endswith("@chatroom")
+            if wxid:
+                contact = self.memory.contact(wxid)
+                if not contact or not int(contact.get("proactive_enabled") or 0):
+                    self.log(f"约定不发（未允许主动）：{name}")
+                    life.pop_promise(self.memory, item)
+                    continue
+                sent_today = self.memory.get_counter(f"p:{wxid}", day)
+                if not policy.can_proactive(contact=contact, sent_today=sent_today, now=now,
+                                            limits=limits):
+                    continue
+            elif policy.in_quiet_hours(now, limits.get("quiet_start", 23), limits.get("quiet_end", 9)):
                 continue
             try:
                 texts = self.brain.proactive(
@@ -731,15 +782,16 @@ class Runtime:
             except Exception as exc:  # noqa: BLE001
                 self.log(f"提约定失败（{name}）：{exc}")
                 continue
-            if texts:
-                self.say(chat_id, texts, False)
-                for part in texts:
-                    self.memory.add_message(
-                        chat_id=chat_id, chat_name=name, is_group=False,
-                        sender_id="self", sender_name="具小涵", role="assistant",
-                        content=part, ts=time.time(),
-                    )
-                self.log(f"提约定：{name} ← {item.get('what')}")
+            if not texts:
+                life.pop_promise(self.memory, item)
+                continue
+            sent = self.say(chat_id, texts, is_group)
+            if not sent:
+                continue
+            self._record_out(chat_id, name, is_group, sent)
+            if wxid and not is_group:
+                self.memory.bump(f"p:{wxid}", day)
+            self.log(f"提约定：{name} ← {item.get('what')}")
             life.pop_promise(self.memory, item)
 
     def _digest_one(self, wxid: str, name: str, is_group: bool = False) -> None:

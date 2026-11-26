@@ -18,24 +18,33 @@ GMEM_MOVEABLE = 0x0002
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ROOT = os.path.join(BASE, "stickers")
 
-_user32 = ctypes.WinDLL("user32", use_last_error=True)
-_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_user32 = None
+_kernel32 = None
 
-_user32.OpenClipboard.argtypes = [wintypes.HWND]
-_user32.OpenClipboard.restype = wintypes.BOOL
-_user32.EmptyClipboard.restype = wintypes.BOOL
-_user32.CloseClipboard.restype = wintypes.BOOL
-_user32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
-_user32.SetClipboardData.restype = ctypes.c_void_p
 
-_kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
-_kernel32.GlobalAlloc.restype = ctypes.c_void_p
-_kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
-_kernel32.GlobalLock.restype = ctypes.c_void_p
-_kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
-_kernel32.GlobalUnlock.restype = wintypes.BOOL
-_kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
-_kernel32.GlobalFree.restype = ctypes.c_void_p
+def _win32():
+    """剪贴板 API 到真要粘贴时再加载，避免在非 Windows 上 import 就失败。"""
+    global _user32, _kernel32
+    if _user32 is not None:
+        return _user32, _kernel32
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.OpenClipboard.restype = wintypes.BOOL
+    user32.EmptyClipboard.restype = wintypes.BOOL
+    user32.CloseClipboard.restype = wintypes.BOOL
+    user32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
+    user32.SetClipboardData.restype = ctypes.c_void_p
+    kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.restype = wintypes.BOOL
+    kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalFree.restype = ctypes.c_void_p
+    _user32, _kernel32 = user32, kernel32
+    return user32, kernel32
 
 
 def set_clipboard_dib(bmp_path: str) -> bool:
@@ -50,24 +59,28 @@ def set_clipboard_dib(bmp_path: str) -> bool:
     payload = data[14:]  # 去掉 BITMAPFILEHEADER，剩 BITMAPINFOHEADER + 像素
     size = len(payload)
 
-    if not _user32.OpenClipboard(None):
+    try:
+        user32, kernel32 = _win32()
+    except (AttributeError, OSError):
+        return False
+    if not user32.OpenClipboard(None):
         return False
     try:
-        _user32.EmptyClipboard()
-        handle = _kernel32.GlobalAlloc(GMEM_MOVEABLE, size)
+        user32.EmptyClipboard()
+        handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, size)
         if not handle:
             return False
-        ptr = _kernel32.GlobalLock(handle)
+        ptr = kernel32.GlobalLock(handle)
         if not ptr:
-            _kernel32.GlobalFree(handle)
+            kernel32.GlobalFree(handle)
             return False
         ctypes.memmove(ptr, payload, size)
-        _kernel32.GlobalUnlock(handle)
-        if not _user32.SetClipboardData(CF_DIB, handle):
-            _kernel32.GlobalFree(handle)
+        kernel32.GlobalUnlock(handle)
+        if not user32.SetClipboardData(CF_DIB, handle):
+            kernel32.GlobalFree(handle)
             return False
     finally:
-        _user32.CloseClipboard()
+        user32.CloseClipboard()
     return True
 
 

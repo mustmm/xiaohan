@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
+import time
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BASE)
@@ -51,6 +53,8 @@ def main() -> int:
         persona=Persona(os.path.join(BASE, "persona.md")),
         llm=FakeLLM(),
     )
+    memory.kv_set("hot_words", json.dumps(["离线"], ensure_ascii=False))
+    memory.kv_set("hot_ts", str(time.time()))
     runtime = Runtime(
         cfg=brain.cfg,
         memory=memory,
@@ -81,6 +85,11 @@ def main() -> int:
     )
     assert ok is False
     print("OK：消息不够时不插话")
+
+    print("\n--- 安全与正确性 ---")
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import safety
+    safety.run()
 
     print("\n全部通过")
     return 0

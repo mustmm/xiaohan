@@ -37,35 +37,68 @@ LOCK = os.path.join(BASE, "data", "xiaohan.lock")
 
 
 def _pid_alive(pid: int) -> bool:
-    try:
-        import ctypes
-
-        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        handle = k32.OpenProcess(0x1000, False, pid)
-        if not handle:
-            return False
-        code = ctypes.c_ulong()
-        k32.GetExitCodeProcess(handle, ctypes.byref(code))
-        k32.CloseHandle(handle)
-        return code.value == 259  # STILL_ACTIVE
-    except Exception:  # noqa: BLE001
+    if pid <= 0:
         return False
-
-
-def acquire_lock() -> bool:
-    """单实例：已经在跑了就别再起一个，两个进程抢键鼠会打架。"""
-    os.makedirs(os.path.dirname(LOCK), exist_ok=True)
-    if os.path.exists(LOCK):
+    if os.name == "nt":
         try:
-            with open(LOCK, encoding="utf-8") as fh:
-                pid = int((fh.read() or "0").strip())
-        except (OSError, ValueError):
-            pid = 0
-        if pid and pid != os.getpid() and _pid_alive(pid):
+            import ctypes
+
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            handle = k32.OpenProcess(0x1000, False, pid)
+            if not handle:
+                return False
+            code = ctypes.c_ulong()
+            k32.GetExitCodeProcess(handle, ctypes.byref(code))
+            k32.CloseHandle(handle)
+            return code.value == 259  # STILL_ACTIVE
+        except Exception:  # noqa: BLE001
             return False
-    with open(LOCK, "w", encoding="utf-8") as fh:
-        fh.write(str(os.getpid()))
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
     return True
+
+
+def _read_lock_pid(path: str) -> int:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return int((fh.read() or "0").strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def acquire_lock(path: str | None = None) -> bool:
+    """单实例：已经在跑了就别再起一个，两个进程抢键鼠会打架。
+
+    用 O_EXCL 创建锁文件，避免两个进程同时看到「没有锁」然后一起启动。
+    """
+    path = path or LOCK
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    for _ in range(3):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            pid = _read_lock_pid(path)
+            if pid == os.getpid():
+                return True
+            if pid and _pid_alive(pid):
+                return False
+            try:
+                os.remove(path)
+            except OSError:
+                return False
+            continue
+        try:
+            os.write(fd, str(os.getpid()).encode("ascii"))
+        finally:
+            os.close(fd)
+        return True
+    return False
 
 
 def load_config() -> dict:
